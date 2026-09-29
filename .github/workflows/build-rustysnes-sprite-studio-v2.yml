@@ -33,13 +33,9 @@ jobs:
         with:
           workspaces: RustySNES -> target
 
-      - name: Decode and apply Sprite Studio patch
+      - name: Apply Sprite Studio source edits directly
         shell: pwsh
-        run: |
-          python -c "import base64,gzip,pathlib; p=pathlib.Path(r'rustysnes-v2/rustysnes_v2_git.patch.gz.b64'); pathlib.Path('rustysnes_v2.patch').write_bytes(gzip.decompress(base64.b64decode(p.read_text().strip())))"
-          cd RustySNES
-          git apply --check ../rustysnes_v2.patch
-          git apply ../rustysnes_v2.patch
+        run: python rustysnes-v2/apply_sprite_v2.py
 
       - name: Build Windows EXE
         shell: pwsh
@@ -58,7 +54,7 @@ jobs:
           F8: open/close Sprite Studio
           TAB: hold for fast-forward (default 6x)
           Backspace: hold for continuous rewind
-          Settings -> Input: rebind Fast-forward and Rewind, set FF speed and rewind buffer
+          Settings -> Input: configure Fast-forward/Rewind key names, FF speed and rewind buffer
 
           Sprite Studio detects visible SNES OBJ pixels from PPU tags, groups nearby parts into figures,
           and exports transparent PNGs to Pictures/RustySNES_Sprite_Studio/<game>/.
