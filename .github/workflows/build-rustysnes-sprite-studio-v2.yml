@@ -21,9 +21,6 @@ jobs:
         with:
           toolchain: 1.96.0
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
       - name: Clone exact RustySNES source
         shell: pwsh
         run: |
@@ -31,16 +28,15 @@ jobs:
           cd RustySNES
           git checkout 98f8d398020b8798b16076fae315960031c6b3b7
 
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: RustySNES -> target
+
       - name: Decode and apply Sprite Studio patch
         shell: pwsh
         run: |
-          $b64 = Get-Content "rustysnes-v2/rustysnes_v2_git.patch.gz.b64" -Raw
-          [IO.File]::WriteAllBytes("patch.gz", [Convert]::FromBase64String($b64.Trim()))
-          $in = [IO.File]::OpenRead("patch.gz")
-          $gz = New-Object IO.Compression.GzipStream($in,[IO.Compression.CompressionMode]::Decompress)
-          $out = [IO.File]::Create("rustysnes_v2.patch")
-          $gz.CopyTo($out)
-          $out.Close(); $gz.Close(); $in.Close()
+          python -c "import base64,gzip,pathlib; p=pathlib.Path(r'rustysnes-v2/rustysnes_v2_git.patch.gz.b64'); pathlib.Path('rustysnes_v2.patch').write_bytes(gzip.decompress(base64.b64decode(p.read_text().strip())))"
           cd RustySNES
           git apply --check ../rustysnes_v2.patch
           git apply ../rustysnes_v2.patch
