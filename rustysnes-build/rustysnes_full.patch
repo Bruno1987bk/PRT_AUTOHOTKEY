@@ -1,0 +1,228 @@
+diff --git a/crates/rustysnes-frontend/Cargo.toml b/crates/rustysnes-frontend/Cargo.toml
+index e716939..e481f77 100644
+--- a/crates/rustysnes-frontend/Cargo.toml
++++ b/crates/rustysnes-frontend/Cargo.toml
+@@ -65,7 +65,7 @@ path = "src/main.rs"
+ # reduced-input-latency benefit on single-player play with sound, cheats, watchpoints,
+ # breakpoints, port2-peripheral, voice-mutes, run-ahead, and netplay, with no
+ # movies/scripting/RetroAchievements/rewind-recording in use.
+-default = ["wasm-winit", "help-tui"]
++default = ["wasm-winit", "help-tui", "debug-hooks", "scripting", "cheats", "netplay", "retroachievements", "hd-pack", "gpu-timing"]
+ wasm-winit = []
+ wasm-canvas = []
+ emu-thread = ["dep:libc"]
+diff --git a/crates/rustysnes-frontend/src/app.rs b/crates/rustysnes-frontend/src/app.rs
+index 35148e3..e758726 100644
+--- a/crates/rustysnes-frontend/src/app.rs
++++ b/crates/rustysnes-frontend/src/app.rs
+@@ -218,6 +218,10 @@ struct Active {
+     /// the audio resampler's DRC ratio (so alt-speed audio pitch-shifts instead of over/underrunning
+     /// the ring).
+     speed: f32,
++    /// Previous speed while the configurable fast-forward key is held.
++    fast_forward_restore: Option<f32>,
++    /// Whether the configurable rewind key is currently held.
++    rewind_held: bool,
+     /// The wall-clock time spent producing this present's emulated frame(s) (`v1.0.0`, the
+     /// Performance panel), or `None` when nothing was measured this present — always `None` on
+     /// the `emu-thread` build (frame production happens on a different thread, outside this
+@@ -620,13 +624,50 @@ impl ApplicationHandler<AppEvent> for App {
+                         }
+                     }
+                 } else {
+-                    // `v1.0.1` global hotkeys — fixed, not rebindable, checked before gameplay
++                    // Full-build system hotkeys: fast-forward and rewind are held actions and are
++                    // configurable from Settings -> Input. Handle both press and release edges.
++                    let handled_as_hold_hotkey = if !active.egui_ctx.egui_wants_keyboard_input()
++                        && let winit::keyboard::PhysicalKey::Code(code) = key_event.physical_key
++                    {
++                        let name = format!("{code:?}");
++                        if name == self.config.hotkeys.fast_forward {
++                            if key_event.state.is_pressed() {
++                                if active.fast_forward_restore.is_none() {
++                                    active.fast_forward_restore = Some(active.speed);
++                                    active.speed = self.config.hotkeys.fast_forward_speed.clamp(2.0, 20.0);
++                                    active.pacer.set_rate(
++                                        self.config.region.frame_rate() * f64::from(active.speed),
++                                    );
++                                    active.shell.status = format!("Fast-forward: {:.1}x", active.speed);
++                                }
++                            } else if let Some(old) = active.fast_forward_restore.take() {
++                                active.speed = old;
++                                active.pacer.set_rate(
++                                    self.config.region.frame_rate() * f64::from(active.speed),
++                                );
++                                active.shell.status = format!("Speed: {:.0}%", active.speed * 100.0);
++                            }
++                            true
++                        } else if name == self.config.hotkeys.rewind {
++                            active.rewind_held = key_event.state.is_pressed();
++                            if active.rewind_held {
++                                active.shell.status = "Rewind...".into();
++                            }
++                            true
++                        } else {
++                            false
++                        }
++                    } else {
++                        false
++                    };
++                    // `v1.0.1` global hotkeys — checked before gameplay latching.
+                     // latching. Only on the key-DOWN edge, and never on OS auto-repeat (holding a
+                     // hotkey must not spam Reset/Quit/etc. every ~30ms) — see
+                     // `Self::hotkey_menu_action`. Suppressed while an egui widget (e.g. a Settings
+                     // text field) has keyboard focus, so e.g. typing a space doesn't also toggle
+                     // pause.
+-                    let handled_as_hotkey = if key_event.state.is_pressed()
++                    let handled_as_hotkey = if !handled_as_hold_hotkey
++                        && key_event.state.is_pressed()
+                         && !key_event.repeat
+                         && !active.egui_ctx.egui_wants_keyboard_input()
+                         && let winit::keyboard::PhysicalKey::Code(code) = key_event.physical_key
+@@ -635,7 +676,7 @@ impl ApplicationHandler<AppEvent> for App {
+                     } else {
+                         false
+                     };
+-                    if !handled_as_hotkey {
++                    if !handled_as_hotkey && !handled_as_hold_hotkey {
+                         Self::latch_key(active, &self.config, &key_event);
+                     }
+                 }
+@@ -1112,6 +1153,8 @@ impl App {
+             },
+             pacer: Pacer::new(self.config.region.frame_rate()),
+             speed: 1.0,
++            fast_forward_restore: None,
++            rewind_held: false,
+             last_frame_time_ms: None,
+             perf: crate::perf::PerfStats::new(),
+             frames_this_present: 0,
+@@ -1497,7 +1540,19 @@ impl App {
+             #[cfg(not(feature = "emu-thread"))]
+             let mut run_ahead_frame = None;
+             #[cfg(not(feature = "emu-thread"))]
+-            let audio_samples = if paused {
++            let audio_samples = if active.rewind_held {
++                active.pacer.idle();
++                active.last_frame_time_ms = None;
++                active.produce_sample_ms = None;
++                if !active.rewind.step_back(&mut emu) {
++                    active.shell.status = if active.rewind.is_enabled() {
++                        "Rewind: buffer empty".into()
++                    } else {
++                        "Rewind: disabled".into()
++                    };
++                }
++                Vec::new()
++            } else if paused {
+                 active.pacer.idle();
+                 active.last_frame_time_ms = None;
+                 active.produce_sample_ms = None;
+diff --git a/crates/rustysnes-frontend/src/config.rs b/crates/rustysnes-frontend/src/config.rs
+index f2f2981..1ebdc39 100644
+--- a/crates/rustysnes-frontend/src/config.rs
++++ b/crates/rustysnes-frontend/src/config.rs
+@@ -573,7 +573,9 @@ impl Default for RewindConfig {
+         // for why full snapshots (not delta-compressed keyframes) were chosen. Off by default
+         // (`capacity: 0`) until Settings UI + a hotkey to actually trigger it lands.
+         Self {
+-            capacity: 0,
++            // Full desktop build: rewind is useful enough to be ready out of the box.
++            // 300 snapshots at one every 6 frames is about 30 seconds at 60 fps.
++            capacity: 300,
+             interval_frames: 6,
+         }
+     }
+@@ -791,6 +793,31 @@ impl RecentRoms {
+     }
+ }
+ 
++
++/// Rebindable emulator/system hotkeys for the full desktop build.
++///
++/// Key names use the same `winit::keyboard::KeyCode` debug strings as player bindings.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(default)]
++pub struct SystemHotkeyConfig {
++    /// Hold for fast-forward.
++    pub fast_forward: String,
++    /// Hold to walk backwards through the rewind ring.
++    pub rewind: String,
++    /// Speed used while fast-forward is held.
++    pub fast_forward_speed: f32,
++}
++
++impl Default for SystemHotkeyConfig {
++    fn default() -> Self {
++        Self {
++            fast_forward: "Tab".into(),
++            rewind: "F5".into(),
++            fast_forward_speed: 6.0,
++        }
++    }
++}
++
+ /// The full frontend config (serialized to `config.toml`).
+ ///
+ /// `Default` is implemented by hand rather than derived because `p2` must NOT be
+@@ -817,6 +844,8 @@ pub struct Config {
+     pub port2_peripheral: PeripheralKind,
+     /// Rewind (`v0.3.0 "Continuum"`).
+     pub rewind: RewindConfig,
++    /// Rebindable emulator/system hotkeys.
++    pub hotkeys: SystemHotkeyConfig,
+     /// Run-ahead (`v0.3.0 "Continuum"`).
+     pub run_ahead: RunAheadConfig,
+     /// The desktop UX shell's egui visual theme (`v1.0.0`).
+@@ -847,6 +876,7 @@ impl Default for Config {
+             p2: KeyBindings::default_p2(),
+             port2_peripheral: PeripheralKind::default(),
+             rewind: RewindConfig::default(),
++            hotkeys: SystemHotkeyConfig::default(),
+             run_ahead: RunAheadConfig::default(),
+             theme: AppTheme::default(),
+             first_run_seen: false,
+diff --git a/crates/rustysnes-frontend/src/ui_shell.rs b/crates/rustysnes-frontend/src/ui_shell.rs
+index 8a7adc0..e744646 100644
+--- a/crates/rustysnes-frontend/src/ui_shell.rs
++++ b/crates/rustysnes-frontend/src/ui_shell.rs
+@@ -383,7 +383,7 @@ pub struct ShellInfo {
+ ///
+ /// `1.0` (100%) is the determinism-safe default the app always launches at — speed is transient
+ /// session state (`Active::speed`), never persisted to `config.toml`.
+-pub const SPEED_PRESETS: [f32; 7] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0];
++pub const SPEED_PRESETS: [f32; 11] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0];
+ 
+ /// Apply the configured [`crate::config::AppTheme`] to the egui context (`v1.0.0`).
+ ///
+@@ -1478,6 +1478,30 @@ impl ShellState {
+             ui.label("Waiting for a key press — Esc cancels.");
+         }
+         ui.separator();
++        ui.collapsing("System hotkeys / speed", |ui| {
++            ui.label("Use winit KeyCode names (examples: Tab, F5, KeyQ, ShiftLeft).");
++            egui::Grid::new("system_hotkeys_grid").num_columns(2).striped(true).show(ui, |ui| {
++                ui.label("Fast-forward (hold)");
++                ui.text_edit_singleline(&mut cfg.hotkeys.fast_forward);
++                ui.end_row();
++                ui.label("Rewind (hold)");
++                ui.text_edit_singleline(&mut cfg.hotkeys.rewind);
++                ui.end_row();
++            });
++            ui.add(
++                egui::Slider::new(&mut cfg.hotkeys.fast_forward_speed, 2.0..=20.0)
++                    .text("Fast-forward speed")
++                    .suffix("x"),
++            );
++            ui.separator();
++            ui.label("Rewind buffer (changes apply after restarting the emulator):");
++            ui.add(egui::Slider::new(&mut cfg.rewind.capacity, 0..=1200).text("Snapshots"));
++            ui.add(
++                egui::Slider::new(&mut cfg.rewind.interval_frames, 1..=12)
++                    .text("Record every N frames"),
++            );
++        });
++        ui.separator();
+         // P2 key bindings (`v1.25.0`) — previously unreachable: `config.p2` existed
+         // and round-tripped, but no gameplay path consulted it.
+         ui.collapsing("P2 key bindings", |ui| {
