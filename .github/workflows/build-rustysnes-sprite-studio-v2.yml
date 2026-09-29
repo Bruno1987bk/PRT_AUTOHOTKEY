@@ -1,0 +1,76 @@
+name: Build RustySNES Sprite Studio v2
+
+on:
+  push:
+    branches: [rustysnes-sprite-studio-v2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout build files
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.96
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clone exact RustySNES source
+        shell: pwsh
+        run: |
+          git clone https://github.com/doublegate/RustySNES.git RustySNES
+          cd RustySNES
+          git checkout 98f8d398020b8798b16076fae315960031c6b3b7
+
+      - name: Decode and apply Sprite Studio patch
+        shell: pwsh
+        run: |
+          $b64 = Get-Content "rustysnes-v2/rustysnes_v2_git.patch.gz.b64" -Raw
+          [IO.File]::WriteAllBytes("patch.gz", [Convert]::FromBase64String($b64.Trim()))
+          $in = [IO.File]::OpenRead("patch.gz")
+          $gz = New-Object IO.Compression.GzipStream($in,[IO.Compression.CompressionMode]::Decompress)
+          $out = [IO.File]::Create("rustysnes_v2.patch")
+          $gz.CopyTo($out)
+          $out.Close(); $gz.Close(); $in.Close()
+          cd RustySNES
+          git apply --check ../rustysnes_v2.patch
+          git apply ../rustysnes_v2.patch
+
+      - name: Build Windows EXE
+        shell: pwsh
+        working-directory: RustySNES
+        run: cargo build -p rustysnes-frontend --release --features "full,gpu-timing"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item "RustySNES/target/release/rustysnes.exe" "package/RustySNES_Sprite_Studio_v2.exe"
+          @"
+          RustySNES Sprite Studio v2
+
+          Tools -> HD Sprite Studio
+          F8: open/close Sprite Studio
+          TAB: hold for fast-forward (default 6x)
+          Backspace: hold for continuous rewind
+          Settings -> Input: rebind Fast-forward and Rewind, set FF speed and rewind buffer
+
+          Sprite Studio detects visible SNES OBJ pixels from PPU tags, groups nearby parts into figures,
+          and exports transparent PNGs to Pictures/RustySNES_Sprite_Studio/<game>/.
+          "@ | Set-Content -Encoding UTF8 "package/README_SPRITE_STUDIO.txt"
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustySNES_Sprite_Studio_v2_Windows
+          path: package/*
+          if-no-files-found: error
